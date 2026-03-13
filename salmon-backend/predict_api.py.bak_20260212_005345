@@ -1,0 +1,976 @@
+"""
+Flask API server for fish origin classification
+Serves the predict_web.html frontend and provides prediction API
+
+SECURITY NOTES:
+- Images are processed in memory only (no disk storage)
+- Default: localhost-only access (127.0.0.1)
+- CORS restricted to same-origin requests
+- Request size limited to 50MB
+- Generic error messages returned to clients
+- Debug mode disabled by default
+
+USAGE:
+  Development:  FLASK_DEBUG=true python predict_api.py
+  Production:   python predict_api.py
+  Custom host:  FLASK_HOST=0.0.0.0 python predict_api.py
+"""
+
+import sys
+import os
+from pathlib import Path
+import base64
+import io
+import uuid
+
+# Add project root to path
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+sys.path.insert(0, project_root)
+
+from flask import Flask, request, jsonify, send_from_directory, Response
+from flask_cors import CORS
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import cv2
+import tifffile as tiff
+
+from src.config import IMG_SIZE, NORMALIZE_MEAN, NORMALIZE_STD, CHECKPOINT_PATH
+from src.model.simple_multimodal_cnn import create_simple_multimodal_cnn
+from src.utils import get_device
+from src.image_preprocessing import preprocess_img_pipeline
+from src.aws_config import (
+    INFERENCE_S3_BUCKET,
+    INFERENCE_S3_BASE_PREFIX,
+    DYNAMODB_TABLE_NAME,
+    AWS_REGION
+)
+from src.aws_utils import (
+    generate_job_id,
+    generate_image_id,
+    upload_image_to_s3,
+    create_job_meta,
+    save_image_item,
+    update_job_meta_num_images,
+    get_job_num_images,
+    get_all_history_data,
+    get_all_jobs,
+    get_job_images
+)
+from src.aws_config import INFERENCE_S3_BUCKET, AWS_REGION
+import boto3
+
+app = Flask(__name__, static_folder='.')
+# Security: Limit request size to 50MB
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+
+# CORS configuration - backward compatible with development and production
+# Development: If FRONTEND_URL is not set, allows all origins (existing behavior)
+# Production: Set FRONTEND_URL environment variable to restrict to specific domain
+FRONTEND_URL = os.getenv('FRONTEND_URL', None)
+
+# Build allowed origins list
+allowed_origins = [
+    "http://localhost:5502",
+    "http://127.0.0.1:5502",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+# If production URL is set, add it to the list
+if FRONTEND_URL:
+    allowed_origins.append(FRONTEND_URL)
+
+# If no production URL is set, use wildcard for development (maintains existing behavior)
+if not FRONTEND_URL:
+    allowed_origins = ["*"]
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": allowed_origins,  # Backward compatible: "*" in dev, restricted in prod
+        "methods": ["POST", "GET", "PUT", "OPTIONS"],  # Added PUT for presigned upload
+        "allow_headers": ["Content-Type", "Authorization"],
+        "expose_headers": ["Content-Length", "Content-Type"]  # For presigned upload
+    }
+})
+
+# Global variables
+device = None
+model = None
+class_names = ['Hatchery', 'Natural']
+ACTIVE_MODEL_VERSION = None  # Will be set after loading checkpoint
+
+# FL normalization parameters
+FL_APPROX_MEAN = 60.0
+FL_APPROX_STD = 10.0
+
+def normalize_fl(fl_value):
+    """Normalize FL value"""
+    return (fl_value - FL_APPROX_MEAN) / FL_APPROX_STD
+
+
+def resolve_checkpoint_path():
+    """
+    Resolve checkpoint path from env/config defaults.
+
+    Priority:
+    1) CHECKPOINT_PATH env var (absolute or relative to project root)
+    2) src.config.CHECKPOINT_PATH (absolute or relative to project root)
+    3) project_root/best.ckpt
+    4) legacy training output path (kept for backward compatibility)
+    """
+    env_path = os.getenv('CHECKPOINT_PATH')
+    if env_path:
+        p = Path(env_path)
+        if not p.is_absolute():
+            p = Path(project_root) / p
+        return str(p)
+
+    if CHECKPOINT_PATH:
+        p = Path(CHECKPOINT_PATH)
+        if not p.is_absolute():
+            p = Path(project_root) / p
+        return str(p)
+
+    return str(Path(project_root) / "best.ckpt")
+
+def preprocess_image(img_array):
+    """Preprocess image using the same pipeline as training"""
+    # Core preprocessing pipeline
+    img_proc = preprocess_img_pipeline(img_array)  # H W 3, [0,1]
+    
+    # Convert to PIL RGB for torchvision transforms
+    pil_img = Image.fromarray((img_proc * 255).astype(np.uint8), mode="RGB")
+    
+    # Apply transforms
+    transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=NORMALIZE_MEAN, std=NORMALIZE_STD),
+    ])
+    
+    img_tensor = transform(pil_img).unsqueeze(0)  # Add batch dimension
+    return img_tensor
+
+def grad_cam(model, image, tabular_features, device, target_class=None):
+    """Generate Grad-CAM heatmap"""
+    model.eval()
+    
+    # Find the last convolutional layer in image_features
+    target_layer = None
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Conv2d):
+            target_layer = name
+    
+    if target_layer is None:
+        return None, None
+    
+    activations = {}
+    gradients = {}
+    
+    def forward_hook(name):
+        def hook(module, input, output):
+            activations[name] = output.detach()
+        return hook
+    
+    def backward_hook(name):
+        def hook(module, grad_input, grad_output):
+            gradients[name] = grad_output[0].detach()
+        return hook
+    
+    # Register hooks
+    handles = []
+    for name, module in model.named_modules():
+        if name == target_layer:
+            handle_forward = module.register_forward_hook(forward_hook(name))
+            handle_backward = module.register_full_backward_hook(backward_hook(name))
+            handles = [handle_forward, handle_backward]
+            break
+    
+    # Forward pass
+    image = image.to(device)
+    image.requires_grad = True
+    
+    output = model(image, tabular_features)
+    
+    if target_class is None:
+        target_class = output.argmax(dim=1).item()
+    
+    # Backward pass
+    model.zero_grad()
+    output[0, target_class].backward()
+    
+    # Generate CAM
+    if target_layer in gradients and target_layer in activations:
+        grad = gradients[target_layer]
+        act = activations[target_layer]
+        
+        # Global average pooling of gradients
+        weights = grad.mean(dim=(2, 3), keepdim=True)
+        
+        # Weighted combination of activation maps
+        cam = (weights * act).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+        
+        # Normalize
+        cam = cam.squeeze().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        
+        # Resize to input size
+        cam = cv2.resize(cam, (IMG_SIZE, IMG_SIZE))
+        
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+        
+        return cam, target_class
+    
+    # Remove hooks if failed
+    for handle in handles:
+        handle.remove()
+    
+    return None, None
+
+def image_to_base64(img_array):
+    """Convert image array to base64 PNG string"""
+    pil_img = Image.fromarray(img_array)
+    buffer = io.BytesIO()
+    pil_img.save(buffer, format='PNG')
+    img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    return img_str
+
+def overlay_heatmap(img_array, heatmap):
+    """Overlay heatmap on image"""
+    h, w = img_array.shape[:2]
+    heatmap_resized = cv2.resize(heatmap, (w, h))
+    
+    # Convert heatmap to RGB
+    heatmap_colored = cv2.applyColorMap((heatmap_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB)
+    
+    # Overlay with alpha blending
+    overlay = cv2.addWeighted(img_array, 0.6, heatmap_colored, 0.4, 0)
+    return overlay
+
+def process_single_image(job_id, image_data):
+    """
+    Process a single image: inference + upload to S3 + save to DynamoDB
+    
+    Parameters:
+        job_id: Integer
+        image_data: Dict with keys: image (base64), sex, fl, filename (optional)
+    
+    Returns:
+        Dict with prediction results and metadata
+    """
+    import os
+    
+    # 1) Derive image_id from the original image name (stable across re-uploads)
+    # Prefer request-provided filename; fallback to an autogenerated id if missing.
+    original_filename = image_data.get('filename')
+    if original_filename:
+        original_filename = os.path.basename(str(original_filename))
+        # Keep filename-like characters; DynamoDB allows any string, but we normalize
+        cleaned_filename = "".join(c for c in original_filename if c.isalnum() or c in ('_', '-', '.'))
+        image_id = cleaned_filename
+        base_name = os.path.splitext(cleaned_filename)[0]
+    else:
+        image_id = generate_image_id()
+        current_num = get_job_num_images(job_id)
+        base_name = f"img_{current_num + 1:03d}"
+    
+    # 3. Decode image
+    image_base64 = image_data.get('image')
+    if not image_base64:
+        raise ValueError('No image provided')
+    
+    image_bytes = base64.b64decode(image_base64)
+    img_array = tiff.imread(io.BytesIO(image_bytes))
+    
+    # Convert to RGB if grayscale
+    if img_array.ndim == 2:
+        img_array = np.stack([img_array] * 3, axis=-1)
+    elif img_array.ndim == 3 and img_array.shape[2] == 1:
+        img_array = np.repeat(img_array, 3, axis=2)
+    
+    # Normalize to uint8 if needed
+    if img_array.dtype != np.uint8:
+        if img_array.max() > 1.0:
+            img_array = (img_array / img_array.max() * 255).astype(np.uint8)
+        else:
+            img_array = (img_array * 255).astype(np.uint8)
+    
+    # 3. Get features
+    sex = int(image_data.get('sex', 2))
+    fl = float(image_data.get('fl', 60))
+    fork_length = fl
+    
+    # 4. Preprocess and inference
+    img_tensor = preprocess_image(img_array)
+    fl_value = normalize_fl(fl)
+    
+    tabular_features = {
+        'sex': torch.tensor([sex], dtype=torch.long).to(device),
+        'fl': torch.tensor([fl_value], dtype=torch.float32).to(device),
+        'year': torch.tensor([0], dtype=torch.long).to(device)
+    }
+    
+    # Make prediction
+    with torch.no_grad():
+        output = model(img_tensor.to(device), tabular_features)
+        probabilities = F.softmax(output, dim=1)
+        prediction = output.argmax(dim=1).item()
+        confidence = probabilities[0, prediction].item()
+    
+    # Generate Grad-CAM
+    heatmap, _ = grad_cam(model, img_tensor, tabular_features, device)
+    
+    # 5. Generate overlay image (only overlay, no separate heatmap)
+    raw_image = img_array
+    if heatmap is not None:
+        overlay_image = overlay_heatmap(img_array, heatmap)
+    else:
+        overlay_image = img_array
+    
+    # 6. Upload to S3 (only raw and overlay)
+    # S3 keys with base prefix folder
+    # Use original filename with suffix for naming
+    raw_key = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/raw/{base_name}.tiff"
+    overlay_key = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/results/{base_name}_overlay.png"
+    raw_display_key = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/results/{base_name}_raw.png"
+    
+    # Upload raw image (TIFF for download)
+    raw_upload_success, raw_upload_error = upload_image_to_s3(
+        raw_image, INFERENCE_S3_BUCKET, raw_key, 'TIFF'
+    )
+    if not raw_upload_success:
+        print(f"[ERROR] Failed to upload raw image to S3: {raw_upload_error}")
+        print(f"[ERROR] S3 Key: {raw_key}, Bucket: {INFERENCE_S3_BUCKET}")
+    else:
+        print(f"[SUCCESS] Uploaded raw image to S3: {raw_key}")
+    
+    # Upload raw as PNG for in-browser display (browsers cannot display TIFF)
+    raw_display_success, _ = upload_image_to_s3(
+        raw_image, INFERENCE_S3_BUCKET, raw_display_key, 'PNG'
+    )
+    if not raw_display_success:
+        print(f"[WARN] Failed to upload raw display PNG to S3: {raw_display_key}")
+    else:
+        print(f"[SUCCESS] Uploaded raw display PNG to S3: {raw_display_key}")
+    
+    # Upload overlay image
+    overlay_upload_success, overlay_upload_error = upload_image_to_s3(
+        overlay_image, INFERENCE_S3_BUCKET, overlay_key, 'PNG'
+    )
+    if not overlay_upload_success:
+        print(f"[ERROR] Failed to upload overlay image to S3: {overlay_upload_error}")
+        print(f"[ERROR] S3 Key: {overlay_key}, Bucket: {INFERENCE_S3_BUCKET}")
+    else:
+        print(f"[SUCCESS] Uploaded overlay image to S3: {overlay_key}")
+    
+    # 7. Save to DynamoDB (no heatmap_key)
+    db_success, db_error = save_image_item(
+        job_id=job_id,
+        image_id=image_id,
+        raw_key=raw_key,
+        overlay_key=overlay_key,
+        pred_label=prediction,
+        confidence=confidence,
+        fork_length=fork_length,
+        sex=sex
+    )
+    
+    if not db_success:
+        print(f"[ERROR] Failed to save to DynamoDB: {db_error}")
+        print(f"[ERROR] Job ID: {job_id}, Image ID: {image_id}")
+    else:
+        print(f"[SUCCESS] Saved to DynamoDB: job_id={job_id}, image_id={image_id}, confidence={confidence:.4f}, pred_label={prediction}")
+    
+    # Check overall storage status
+    s3_uploaded = raw_upload_success and overlay_upload_success
+    
+    # 8. Return result
+    return {
+        'image_id': image_id,
+        'prediction': prediction,
+        'class_name': class_names[prediction],
+        'confidence': float(confidence),
+        'probabilities': [
+            float(probabilities[0, 0].item()),
+            float(probabilities[0, 1].item())
+        ],
+        'original_image': image_to_base64(img_array),
+        'heatmap_image': image_to_base64(overlay_image) if heatmap is not None else None,
+        's3_keys': {
+            'raw_key': raw_key,
+            'overlay_key': overlay_key,
+            'raw_display_key': raw_display_key,
+        },
+        'storage_status': {
+            's3_uploaded': s3_uploaded,
+            'dynamodb_saved': db_success,
+            'errors': {
+                's3_raw_error': raw_upload_error if not raw_upload_success else None,
+                's3_overlay_error': overlay_upload_error if not overlay_upload_success else None,
+                'dynamodb_error': db_error if not db_success else None
+            }
+        }
+    }
+
+@app.route('/')
+def index():
+    """Serve the HTML frontend"""
+    return send_from_directory('.', 'predict_web.html')
+
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    """
+    Unified API endpoint for prediction (supports single or batch images)
+    
+    Request format (single image - backward compatible):
+    {
+        "image": "base64_string",
+        "sex": 0,
+        "fl": 60.5,
+        "filename": "803_2X.tif"  // Optional: original filename
+    }
+    
+    Request format (batch images):
+    {
+        "images": [
+            {"image": "base64_string1", "sex": 0, "fl": 60.5, "filename": "803_2X.tif"},
+            {"image": "base64_string2", "sex": 1, "fl": 65.0, "filename": "805_2X.tif"}
+        ],
+        "job_id": "optional-existing-job-id",
+        "user_id": "optional-user-id"
+    }
+    
+    Note:
+    - job_id format: UUID string (e.g., "550e8400-e29b-41d4-a716-446655440000")
+    - If filename is provided, S3 keys will use original filename:
+      - Raw: {filename_base}.tiff
+      - Overlay: {filename_base}_overlay.png
+    - If filename is not provided, uses sequence number: img_001, img_002, etc.
+    """
+    try:
+        data = request.json
+        
+        # ========== Determine if single or batch mode ==========
+        if 'images' in data:
+            # Batch processing mode
+            images_data = data.get('images', [])
+            if not images_data:
+                return jsonify({'error': 'No images provided'}), 400
+            
+            # Get or create job_id
+            job_id = data.get('job_id')
+            if not job_id:
+                job_id = generate_job_id()
+                user_id = data.get('user_id', 'anonymous')
+                raw_prefix = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/raw/"
+                result_prefix = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/results/"
+                create_job_meta(job_id, user_id, raw_prefix, result_prefix, ACTIVE_MODEL_VERSION or "unknown")
+            
+            # Process each image
+            results = []
+            successful_count = 0
+            failed_count = 0
+            
+            for idx, img_data in enumerate(images_data):
+                try:
+                    # Ensure filename is included if provided
+                    if 'filename' not in img_data:
+                        img_data['filename'] = None
+                    
+                    print(f"[INFO] Processing image {idx + 1}/{len(images_data)}: {img_data.get('filename', 'unknown')}")
+                    result = process_single_image(job_id, img_data)
+                    
+                    # Verify storage status
+                    storage_status = result.get('storage_status', {})
+                    s3_ok = storage_status.get('s3_uploaded', False)
+                    db_ok = storage_status.get('dynamodb_saved', False)
+                    
+                    if not s3_ok:
+                        print(f"[WARNING] Image {idx + 1} S3 upload failed: {storage_status.get('errors', {}).get('s3_raw_error') or storage_status.get('errors', {}).get('s3_overlay_error')}")
+                    if not db_ok:
+                        print(f"[WARNING] Image {idx + 1} DynamoDB save failed: {storage_status.get('errors', {}).get('dynamodb_error')}")
+                    
+                    if s3_ok and db_ok:
+                        successful_count += 1
+                        print(f"[SUCCESS] Image {idx + 1} saved successfully to S3 and DynamoDB")
+                    else:
+                        failed_count += 1
+                        print(f"[WARNING] Image {idx + 1} had storage issues (S3: {s3_ok}, DB: {db_ok})")
+                    
+                    results.append(result)
+                except Exception as e:
+                    import traceback
+                    print(f"[ERROR] Failed to process image {idx + 1}: {str(e)}")
+                    traceback.print_exc()
+                    failed_count += 1
+                    results.append({
+                        'error': str(e),
+                        'image_id': None,
+                        'storage_status': {
+                            's3_uploaded': False,
+                            'dynamodb_saved': False,
+                            'errors': {'processing_error': str(e)}
+                        }
+                    })
+            
+            # Update job meta count (only count successful saves)
+            update_job_meta_num_images(job_id, successful_count)
+            
+            print(f"[SUMMARY] Batch processing complete: {successful_count} successful, {failed_count} failed out of {len(images_data)} total")
+            
+            return jsonify({
+                'job_id': job_id,
+                'num_images': len(results),
+                'successful_count': successful_count,
+                'failed_count': failed_count,
+                'results': results
+            })
+        
+        else:
+            # Single image mode (backward compatible)
+            # Convert to batch format (batch_size=1)
+            single_image_data = {
+                'image': data.get('image'),
+                'sex': data.get('sex', 2),
+                'fl': data.get('fl', 60),
+                'filename': data.get('filename')  # Optional: original filename
+            }
+            
+            if not single_image_data.get('image'):
+                return jsonify({'error': 'No image provided'}), 400
+            
+            # Create new job (single image also creates a job)
+            job_id = generate_job_id()
+            user_id = data.get('user_id', 'anonymous')
+            raw_prefix = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/raw/"
+            result_prefix = f"{INFERENCE_S3_BASE_PREFIX}jobs/{job_id}/results/"
+            create_job_meta(job_id, user_id, raw_prefix, result_prefix, ACTIVE_MODEL_VERSION or "unknown")
+            
+            # Process single image
+            result = process_single_image(job_id, single_image_data)
+            
+            # Update job meta
+            update_job_meta_num_images(job_id, 1)
+            
+            # Return single image format (backward compatible)
+            return jsonify({
+                'job_id': job_id,
+                'image_id': result['image_id'],
+                'prediction': result['prediction'],
+                'class_name': result['class_name'],
+                'confidence': result['confidence'],
+                'probabilities': result['probabilities'],
+                'original_image': result['original_image'],
+                'heatmap_image': result['heatmap_image'],
+                's3_keys': result['s3_keys'],
+                'storage_status': result.get('storage_status', {})
+            })
+        
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Prediction failed: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': 'Prediction failed. Please check your image format and try again.'}), 500
+
+@app.route('/api/results', methods=['GET'])
+def get_results():
+    """
+    Get all inference results from DynamoDB (same format as /api/history)
+    
+    Returns:
+        JSON array of result items, each containing:
+        - job_id: String
+        - image_id: String
+        - confidence: Float
+        - pred_label: Integer (0=Hatchery, 1=Natural)
+        - review_status: String (pending, reviewed, approved)
+        - created_at: String (ISO format)
+        - raw_key: String (S3 key for raw image)
+        - overlay_key: String (S3 key for overlay image)
+    """
+    try:
+        # Fetch all history data (no limits for /api/results)
+        history_data = get_all_history_data(limit_jobs=None, limit_images_per_job=None)
+        
+        if history_data is None:
+            return jsonify([]), 200
+        
+        # Format the data as a simple array with only required fields (same as /api/history)
+        result = []
+        
+        # Flatten images with job info
+        for job in history_data['jobs']:
+            job_id = job['job_id']
+            images = history_data['images_by_job'].get(job_id, [])
+            for image in images:
+                # Only include the required fields
+                image_item = {
+                    'job_id': job_id,
+                    'image_id': image.get('image_id', ''),
+                    'confidence': float(image.get('confidence', 0.0)),
+                    'pred_label': int(image.get('pred_label', 0)),
+                    'review_status': image.get('review_status', 'pending'),
+                    'created_at': image.get('created_at', ''),
+                    'raw_key': image.get('raw_key', ''),
+                    'overlay_key': image.get('overlay_key', '')
+                }
+                result.append(image_item)
+        
+        return jsonify(result), 200
+    except Exception as e:
+        import traceback
+        error_msg = str(e)
+        traceback.print_exc()
+        print(f"[ERROR] Failed to retrieve results: {error_msg}")
+        # Return empty array instead of error for graceful degradation
+        return jsonify([]), 200
+
+@app.route('/api/history', methods=['GET'])
+def get_history():
+    """
+    Get history data from DynamoDB
+    
+    Query parameters:
+        - limit_jobs: Maximum number of jobs to return (default: 50)
+        - limit_images: Maximum number of images per job (default: 1000)
+    
+    Returns:
+        Array of image objects with the following structure:
+        [
+          {
+            "job_id": "string",
+            "image_id": "string",
+            "confidence": 0.95,
+            "pred_label": 0,
+            "review_status": "pending",
+            "created_at": "2026-01-29T12:34:56.789Z",
+            "raw_key": "string",
+            "overlay_key": "string"
+          }
+        ]
+    """
+    try:
+        # Allow None to fetch all data
+        limit_jobs_param = request.args.get('limit_jobs')
+        limit_images_param = request.args.get('limit_images')
+        
+        limit_jobs = int(limit_jobs_param) if limit_jobs_param else None
+        limit_images = int(limit_images_param) if limit_images_param else None
+        
+        # Default to None (fetch all) if not specified
+        history_data = get_all_history_data(limit_jobs=limit_jobs, limit_images_per_job=limit_images)
+        
+        # Format the data as a simple array with only required fields
+        result = []
+        
+        # Flatten images with job info
+        for job in history_data['jobs']:
+            job_id = job['job_id']
+            images = history_data['images_by_job'].get(job_id, [])
+            for image in images:
+                # Only include the required fields
+                image_item = {
+                    'job_id': job_id,
+                    'image_id': image.get('image_id', ''),
+                    'confidence': float(image.get('confidence', 0.0)),
+                    'pred_label': int(image.get('pred_label', 0)),
+                    'review_status': image.get('review_status', 'pending'),
+                    'created_at': image.get('created_at', ''),
+                    'raw_key': image.get('raw_key', ''),
+                    'overlay_key': image.get('overlay_key', '')
+                }
+                result.append(image_item)
+        
+        # Sort images by created_at descending (newest first)
+        result.sort(key=lambda x: x.get('created_at', ''), reverse=True)
+        
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Failed to get history: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to get history: {str(e)}'}), 500
+
+@app.route('/api/image-url', methods=['GET'])
+def get_image_url():
+    """
+    Generate presigned URL for S3 image
+    
+    Query parameters:
+        - s3_key: S3 object key (required)
+        - expiration: URL expiration time in seconds (default: 3600)
+    
+    Returns:
+        JSON object with 'url' field containing the presigned URL
+    """
+    try:
+        s3_key = request.args.get('s3_key')
+        if not s3_key:
+            return jsonify({'error': 's3_key parameter is required'}), 400
+        
+        expiration = request.args.get('expiration', type=int, default=3600)
+        
+        # Initialize S3 client
+        aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        
+        if aws_access_key_id and aws_secret_access_key:
+            s3_client = boto3.client(
+                's3',
+                region_name=AWS_REGION,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key
+            )
+        else:
+            s3_client = boto3.client('s3', region_name=AWS_REGION)
+        
+        # Generate presigned URL
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={
+                'Bucket': INFERENCE_S3_BUCKET,
+                'Key': s3_key
+            },
+            ExpiresIn=expiration
+        )
+        
+        return jsonify({'url': url}), 200
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Failed to generate presigned URL: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to generate image URL: {str(e)}'}), 500
+
+
+@app.route('/api/image', methods=['GET'])
+def get_image():
+    """
+    Return image bytes from S3. If the object is TIFF, convert to PNG so browsers can display it.
+    Used by Manual Review to show original image when raw_display_key (PNG) does not exist (old data).
+    Query parameters:
+        - s3_key: S3 object key (required)
+    Returns:
+        Image bytes (PNG for TIFF input, otherwise as stored) with appropriate Content-Type.
+    """
+    try:
+        s3_key = request.args.get('s3_key')
+        if not s3_key:
+            return jsonify({'error': 's3_key parameter is required'}), 400
+
+        aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        if aws_access_key_id and aws_secret_access_key:
+            s3_client = boto3.client(
+                's3',
+                region_name=AWS_REGION,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key
+            )
+        else:
+            s3_client = boto3.client('s3', region_name=AWS_REGION)
+
+        resp = s3_client.get_object(Bucket=INFERENCE_S3_BUCKET, Key=s3_key)
+        body_bytes = resp['Body'].read()
+        key_lower = s3_key.lower()
+
+        if key_lower.endswith('.tiff') or key_lower.endswith('.tif'):
+            buf = io.BytesIO(body_bytes)
+            arr = tiff.imread(buf)
+            if arr.ndim == 2:
+                if arr.dtype != np.uint8:
+                    if arr.max() > 1.0:
+                        arr = (arr / arr.max() * 255).astype(np.uint8)
+                    else:
+                        arr = (arr * 255).astype(np.uint8)
+                pil_img = Image.fromarray(arr)
+            elif arr.ndim == 3:
+                if arr.shape[2] == 1:
+                    arr = np.squeeze(arr, axis=2)
+                if arr.dtype != np.uint8:
+                    if arr.max() > 1.0:
+                        arr = (arr / arr.max() * 255).astype(np.uint8)
+                    else:
+                        arr = (arr * 255).astype(np.uint8)
+                pil_img = Image.fromarray(arr)
+            else:
+                return jsonify({'error': 'Unsupported TIFF format'}), 400
+            png_buf = io.BytesIO()
+            pil_img.save(png_buf, format='PNG')
+            png_buf.seek(0)
+            return Response(png_buf.getvalue(), mimetype='image/png')
+        elif key_lower.endswith('.png'):
+            return Response(body_bytes, mimetype='image/png')
+        elif key_lower.endswith(('.jpg', '.jpeg')):
+            return Response(body_bytes, mimetype='image/jpeg')
+        else:
+            return Response(body_bytes, mimetype='application/octet-stream')
+    except Exception as e:
+        import traceback
+        try:
+            from botocore.exceptions import ClientError
+            if isinstance(e, ClientError) and e.response.get('Error', {}).get('Code') == 'NoSuchKey':
+                return jsonify({'error': 'Image not found'}), 404
+        except Exception:
+            pass
+        print(f"[ERROR] Failed to get image: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to get image: {str(e)}'}), 500
+
+
+@app.route('/api/presign-upload', methods=['POST'])
+def presign_upload():
+    """
+    Generate presigned URL for S3 file upload (PUT)
+    
+    This endpoint allows frontend to upload files directly to S3 without exposing AWS credentials.
+    Follows AWS best practices: frontend gets temporary presigned URL from backend.
+    
+    Request body:
+        {
+            "filename": "example.tif",  # Original filename (required)
+            "content_type": "image/tiff",  # Optional, defaults to "application/octet-stream"
+            "expiration": 3600,  # Optional, defaults to 1 hour (seconds)
+            "prefix": "raw"  # Optional, defaults to "raw" (subfolder in job directory)
+        }
+    
+    Returns:
+        {
+            "url": "https://s3.amazonaws.com/...",  # Presigned PUT URL
+            "key": "inference-results/jobs/{job_id}/raw/example.tif",  # S3 key
+            "job_id": "uuid",  # Generated job ID
+            "image_id": "uuid",  # Generated image ID
+            "expires_in": 3600  # Expiration time in seconds
+        }
+    
+    Error responses:
+        400: Missing required fields
+        500: Failed to generate presigned URL
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Request body is required'}), 400
+        
+        filename = data.get('filename')
+        if not filename:
+            return jsonify({'error': 'filename is required'}), 400
+        
+        # Optional parameters with defaults
+        content_type = data.get('content_type', 'application/octet-stream')
+        expiration = data.get('expiration', 3600)  # 1 hour default
+        prefix = data.get('prefix', 'raw')  # Default to 'raw' folder
+        
+        # Generate job_id and image_id for the upload
+        job_id = str(uuid.uuid4())
+        image_id = str(uuid.uuid4())
+        
+        # Sanitize filename to prevent path traversal
+        safe_filename = os.path.basename(filename)  # Remove any path components
+        
+        # Construct S3 key: inference-results/jobs/{job_id}/{prefix}/{filename}
+        s3_key = f"{INFERENCE_S3_BASE_PREFIX}{INFERENCE_S3_PREFIX}{job_id}/{prefix}/{safe_filename}"
+        
+        # Initialize S3 client (uses IAM role if on EC2, or credentials from env/aws config)
+        aws_access_key_id = os.getenv('AWS_ACCESS_KEY_ID')
+        aws_secret_access_key = os.getenv('AWS_SECRET_ACCESS_KEY')
+        
+        if aws_access_key_id and aws_secret_access_key:
+            s3_client = boto3.client(
+                's3',
+                region_name=AWS_REGION,
+                aws_access_key_id=aws_access_key_id,
+                aws_secret_access_key=aws_secret_access_key
+            )
+        else:
+            # Use IAM role (recommended for EC2) or ~/.aws/credentials
+            s3_client = boto3.client('s3', region_name=AWS_REGION)
+        
+        # Generate presigned PUT URL
+        presigned_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={
+                'Bucket': INFERENCE_S3_BUCKET,
+                'Key': s3_key,
+                'ContentType': content_type
+            },
+            ExpiresIn=expiration
+        )
+        
+        return jsonify({
+            'url': presigned_url,
+            'key': s3_key,
+            'job_id': job_id,
+            'image_id': image_id,
+            'expires_in': expiration
+        }), 200
+        
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] Failed to generate presigned upload URL: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to generate upload URL: {str(e)}'}), 500
+
+def load_model():
+    """Load the trained model"""
+    global device, model, ACTIVE_MODEL_VERSION
+    
+    print("Loading model...")
+    device = get_device()
+    
+    checkpoint_path = resolve_checkpoint_path()
+    if not os.path.exists(checkpoint_path):
+        # Fallback to older location if needed
+        legacy_path = os.path.join(project_root, "results/simple_multimodal_cnn_20251201_214610/checkpoints/best.ckpt")
+        if os.path.exists(legacy_path):
+            checkpoint_path = legacy_path
+
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            "Checkpoint not found. Set CHECKPOINT_PATH or update src/config.py CHECKPOINT_PATH. "
+            f"Resolved path: {checkpoint_path}"
+        )
+
+    # Use checkpoint filename as model version (saved into DynamoDB job meta)
+    ACTIVE_MODEL_VERSION = os.path.basename(checkpoint_path)
+    
+    # Create model matching the latest 6-layer architecture with adaptive pooling
+    # dropout_rate=0.4 matches the latest training configuration
+    model = create_simple_multimodal_cnn(num_classes=2, dropout_rate=0.4, use_year=False, num_layers=6)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model = model.to(device)
+    model.eval()
+    
+    print(f"✅ Model loaded from: {checkpoint_path}")
+    print(f"✅ Device: {device}")
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("Fish Origin Classification API Server")
+    print("=" * 60)
+    
+    # Load model
+    load_model()
+    
+    # Security settings
+    debug_mode = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
+    host = os.getenv('FLASK_HOST', '127.0.0.1')  # Default to localhost only
+    port = int(os.getenv('FLASK_PORT', '5001'))  # Changed to 5001 to avoid macOS AirPlay conflict
+    
+    if debug_mode:
+        print("⚠️  WARNING: Debug mode is enabled! DO NOT use in production!")
+    
+    print(f"\n🚀 Starting Flask server...")
+    print(f"📱 Access: http://{host}:{port}")
+    print(f"🔒 Security: Debug={debug_mode}, Host={host}")
+    print("=" * 60)
+    
+    # Run Flask app
+    app.run(host=host, port=port, debug=debug_mode)
+

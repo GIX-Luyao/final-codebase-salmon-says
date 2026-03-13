@@ -1,0 +1,24 @@
+[Unit]
+Description=Salmon Say Backend API Server
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/salmon-backend
+# AWS credentials removed - will use IAM Role (if on EC2) or ~/.aws/credentials
+# The code automatically falls back to IAM Role if AWS_ACCESS_KEY_ID is not set
+Environment="AWS_REGION=us-west-2"
+Environment="DYNAMODB_TABLE_NAME=Jobs"
+Environment="INFERENCE_S3_BUCKET=uw-fish-scale-data-879554841091-us-west-2"
+Environment="FLASK_HOST=127.0.0.1"
+Environment="FLASK_PORT=5001"
+Environment="FLASK_DEBUG=False"
+ExecStart=/home/ubuntu/salmon-backend/venv/bin/python /home/ubuntu/salmon-backend/predict_api.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

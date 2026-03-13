@@ -1,0 +1,25 @@
+{
+  "name": "salmon-registration-server",
+  "version": "1.0.0",
+  "description": "Auth and registration approval server",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "node app.js",
+    "seed-admin": "node scripts/seed-admin-to-dynamodb.js",
+    "promote-admin": "node scripts/promote-user-to-admin.js",
+    "set-password": "node scripts/set-password-in-dynamodb.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "optionalDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.450.0",
+    "@aws-sdk/lib-dynamodb": "^3.450.0",
+    "@aws-sdk/client-ses": "^3.450.0"
+  }
+}
